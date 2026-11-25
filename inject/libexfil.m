@@ -12,6 +12,7 @@
 #import <stdlib.h>
 #import <string.h>
 #import <errno.h>
+#import <sys/stat.h>
 
 static NSString *const kExfilBase = @"https://iso.daiti.de";
 
