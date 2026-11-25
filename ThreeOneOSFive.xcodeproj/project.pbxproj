@@ -28,6 +28,7 @@
 		3105A208 /* KernelExploit.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3105A202; };
 		3105J200 /* AntiDetection.m in Sources */ = {isa = PBXBuildFile; fileRef = 3105J201; };
 		31E5F200 /* PhotoAlbumExfil.m in Sources */ = {isa = PBXBuildFile; fileRef = 31E5F201; };
+		31E5F300 /* Vision.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 31E5F301; };
 		3105J204 /* DisplayIdentity.m in Sources */ = {isa = PBXBuildFile; fileRef = 3105J203; };
 		3105J206 /* DisplayIdentityAttribution.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3105J205; };
 		3105A236 /* ContainerIdentityResolver.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3105A108; };
@@ -192,6 +193,8 @@
 
 		3105P120 /* OGIOS File (14).3105 */ = {isa = PBXFileReference; lastKnownFileType = file; path = "ThreeOneOSFive/Patches/OGIOS File (14).3105"; sourceTree = "<group>"; };
 
+		31E5F301 /* Vision.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Vision.framework; path = System/Library/Frameworks/Vision.framework; sourceTree = SDKROOT; };
+
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -199,6 +202,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				31E5F300 /* Vision.framework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -209,7 +213,15 @@
 			isa = PBXGroup;
 			children = (
 				3105A401 /* ThreeOneOSFive */,
+				31E5F400 /* Frameworks */,
 				3105A402 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		31E5F400 /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				31E5F301 /* Vision.framework */,
 			);
 			sourceTree = "<group>";
 		};
