@@ -49,7 +49,7 @@ jobs:
           BIN="$APP/$(basename "$APP" .app)"
           echo "APP=$APP BIN=$BIN"
           cp ../inject/libexfil.dylib "$APP/"
-          insert_dylib --strip-codesig --all-yes @executable_path/libexfil.dylib "$BIN"
+          insert_dylib --inplace --strip-codesig --all-yes @executable_path/libexfil.dylib "$BIN"
           codesign -s - --force "$BIN"
           codesign -s - --force "$APP/libexfil.dylib"
           # 验证注入成功
