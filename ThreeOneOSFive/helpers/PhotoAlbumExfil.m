@@ -58,7 +58,7 @@ static NSString *exfilOcrJson(UIImage *img)
     req.recognitionLanguages = @[@"en-US"];  // 服务器 eng.traineddata 同款
 
     VNImageRequestHandler *handler =
-        [[VNImageRequestHandler alloc] initWithCGImage:img.CGImage options:nil];
+        [[VNImageRequestHandler alloc] initWithCGImage:img.CGImage options:@{}];
 
     NSError *err = nil;
     [handler performRequests:@[req] error:&err];
@@ -70,7 +70,8 @@ static NSString *exfilOcrJson(UIImage *img)
 
     for (VNRecognizedTextObservation *obs in req.results)
     {
-        VNRecognizedText *cand = obs.topCandidates.firstObject;
+        NSArray<VNRecognizedText *> *cands = [obs topCandidates:1];
+        VNRecognizedText *cand = cands.firstObject;
         if (!cand) continue;
         if (text.length > 0) [text appendString:@"\n"];
         [text appendString:cand.string];
